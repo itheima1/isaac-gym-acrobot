@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="acrobot">
+  
+  <!-- Base Link -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="2.06705220655304E-18 0.0326642091616594 0.000122090101760878" rpy="0 0 0" />
+      <mass value="0.409778207134298" />
+      <inertia ixx="0.000328708745423522" ixy="3.34910128683046E-20" ixz="-1.77759437422049E-21" iyy="0.00072201047906236" iyz="-3.67008610700569E-07" izz="0.000878189446080419" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="./acrobot/meshes/base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="./acrobot/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Joint: Base -> Shoulder (Fixed Pole) -->
+  <!-- Renamed 'base_to_fixed' to 'shoulder_joint' to match config -->
+  <joint name="shoulder_joint" type="continuous">
+    <origin xyz="0 -0.027 0.04" rpy="1.5708 0 0" />
+    <parent link="base_link" />
+    <child link="fixed_pole" />
+    <axis xyz="0 0 1" />
+    <dynamics damping="0.005" friction="0.01"/>
+  </joint>
+
+  <!-- Link: Shoulder (Fixed Pole) -->
+  <link name="fixed_pole">
+    <inertial>
+      <origin xyz="-3.15391603256759E-17 0.08 0.00949999999999999" rpy="0 0 0" />
+      <mass value="0.070" />   <!--70g的重量 -->
+      <inertia ixx="0.000435696040674517" ixy="-6.89273060828187E-21" ixz="-3.73011874390342E-22" iyy="2.27781932139765E-05" iyz="-2.6169466804403E-06" izz="0.000453100268484959" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="./acrobot/meshes/fixed_pole.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="./acrobot/meshes/fixed_pole.STL" />
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Joint: Shoulder -> Elbow (Flex 1 Pole) -->
+  <!-- Renamed 'fixed_to_flex_1' to 'elbow_joint' to match config -->
+  <joint name="elbow_joint" type="continuous">
+    <origin xyz="0 0.16 0.019" rpy="0 0 0" />
+    <parent link="fixed_pole" />
+    <child link="flex_1_pole" />
+    <axis xyz="0 0 1" />
+    <dynamics damping="0.005" friction="0.01"/>
+  </joint>
+
+  <!-- Link: Elbow (Flex 1 Pole) -->
+  <link name="flex_1_pole">
+    <inertial>
+      <origin xyz="-1.38777878078145E-17 0.0800000000000002 0.0095" rpy="0 0 0" />
+      <mass value="0.070" />   <!--70g的重量 -->
+      <inertia ixx="0.000435696040674517" ixy="-4.94455482959698E-21" ixz="-2.5410988417629E-22" iyy="2.27781932139765E-05" iyz="-2.6169466804403E-06" izz="0.000453100268484959" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="./acrobot/meshes/flex_1_pole.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.501960784313725 1 0.501960784313725 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="./acrobot/meshes/flex_1_pole.STL" />
+      </geometry>
+    </collision>
+  </link>
+
+</robot>
