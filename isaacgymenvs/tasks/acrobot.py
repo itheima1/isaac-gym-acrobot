@@ -31,6 +31,7 @@ import os
 import torch
 
 from isaacgym import gymutil, gymtorch, gymapi
+from isaacgym.torch_utils import *
 from .base.vec_task import VecTask
 
 class Acrobot(VecTask):
@@ -43,7 +44,7 @@ class Acrobot(VecTask):
         self.max_push_effort = self.cfg["env"]["maxEffort"]
         self.max_episode_length = 500
 
-        self.cfg["env"]["numObservations"] = 4
+        self.cfg["env"]["numObservations"] = 6
         self.cfg["env"]["numActions"] = 1
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
@@ -53,6 +54,13 @@ class Acrobot(VecTask):
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
 
+        # Rigid body state for Tip Height Reward
+        rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_tensor).view(self.num_envs, -1, 13)
+        
+        # Store actions for reward penalty
+        self.actions = torch.zeros((self.num_envs, self.num_actions), device=self.device)
+
     def create_sim(self):
         # set the up axis to be z-up given that assets are y-up by default
         self.up_axis = self.cfg["sim"]["up_axis"]
@@ -60,6 +68,23 @@ class Acrobot(VecTask):
         self.sim = super().create_sim(self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
         self._create_ground_plane()
         self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
+        
+        # Get rigid body indices after creating envs (and loading asset)
+        # Note: asset was loaded in _create_envs, but handle is needed.
+        # However, body indices are per asset.
+        # But wait, gym.get_actor_rigid_body_index is what we need for the global tensor if we use indices.
+        # But we are using a view of (num_envs, num_bodies, 13). So we need the index WITHIN the actor.
+        # The rigid body tensor from acquire_rigid_body_state_tensor is flat: [env0_b0, env0_b1, ..., env1_b0, ...]
+        # So we just need the local index of 'fixed_pole' and 'flex_1_pole'.
+        
+        # We can get this from the asset.
+        # But we need to access the asset which is created in _create_envs.
+        # Since _create_envs is called above, we can assume self.acrobot_asset is available if we store it.
+        # Let's modify _create_envs to store it or get it here.
+        # Actually, simpler: just get it from the first env's actor.
+        
+        # Better yet, let's modify _create_envs to save the body indices.
+
 
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
@@ -87,7 +112,12 @@ class Acrobot(VecTask):
         asset_options.fix_base_link = True
         acrobot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
         self.num_dof = self.gym.get_asset_dof_count(acrobot_asset)
-
+        
+        # Get rigid body indices for reward calculation
+        rigid_body_dict = self.gym.get_asset_rigid_body_dict(acrobot_asset)
+        self.shoulder_body_idx = rigid_body_dict["fixed_pole"]
+        self.elbow_body_idx = rigid_body_dict["flex_1_pole"]
+        
         pose = gymapi.Transform()
         if self.up_axis == 'z':
             pose.p.z = 2.0
@@ -107,46 +137,109 @@ class Acrobot(VecTask):
             acrobot_handle = self.gym.create_actor(env_ptr, acrobot_asset, pose, "acrobot", i, 1, 0)
 
             dof_props = self.gym.get_actor_dof_properties(env_ptr, acrobot_handle)
-            # Joint 0 (Shoulder) is Actuated (EFFORT)
+            # Correct Configuration per User:
+            # Joint 0 (Shoulder) is Actuated (EFFORT) - "带电机"
             dof_props['driveMode'][0] = gymapi.DOF_MODE_EFFORT
-            # Joint 1 (Elbow) is Passive (NONE)
+            # Joint 1 (Elbow) is Passive (NONE) - "轴承"
             dof_props['driveMode'][1] = gymapi.DOF_MODE_NONE
-            dof_props['stiffness'][:] = 0.0
-            dof_props['damping'][:] = 0.0
+            
+            # -----------------------------------------------------------
+            # Joint Limits Configuration
+            # -----------------------------------------------------------
+            dof_props['hasLimits'][:] = True
+            
+            # Joint 0 (Shoulder): Limited to +/- 2*pi (One full rotation)
+            # Reason: Motor wires limitation
+            dof_props['lower'][0] = -2.0 * np.pi
+            dof_props['upper'][0] = 2.0 * np.pi
+            
+            # Joint 1 (Elbow): Unlimited (Continuous Bearing)
+            # Reason: Passive bearing, no wires
+            dof_props['hasLimits'][1] = False
+            dof_props['lower'][1] = -1.0e8 # Effectively infinite
+            dof_props['upper'][1] = 1.0e8
+            
+            # Respect URDF dynamics (damping/friction)
+            # But ensure stiffness is zero for proper passive/effort behavior
+            dof_props['stiffness'][:] = 0.0 
+            
+            # Ensure Elbow (Joint 1) is truly frictionless/passive as requested
+            dof_props['damping'][1] = 0.0001
+            dof_props['friction'][1] = 0.0
+            
             self.gym.set_actor_dof_properties(env_ptr, acrobot_handle, dof_props)
 
             self.envs.append(env_ptr)
             self.acrobot_handles.append(acrobot_handle)
 
     def compute_reward(self):
-        # retrieve environment observations from buffer
-        shoulder_pos = self.obs_buf[:, 0]
-        shoulder_vel = self.obs_buf[:, 1]
-        elbow_pos = self.obs_buf[:, 2]
-        elbow_vel = self.obs_buf[:, 3]
+        # Refresh Rigid Body State for Tip Height
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        
+        shoulder_pos = self.dof_pos[:, 0]
+        elbow_pos = self.dof_pos[:, 1]
+        shoulder_vel = self.dof_vel[:, 0]
+        elbow_vel = self.dof_vel[:, 1]
+        
+        # Calculate Tip Height using Rigid Body States
+        # rb_states: [num_envs, num_bodies, 13]
+        # 13: pos(3), quat(4), lin_vel(3), ang_vel(3)
+        rb_states = self.rigid_body_states.view(self.num_envs, -1, 13)
+        
+        # Shoulder Position (Z-height of fixed_pole origin)
+        # Note: fixed_pole origin is at the shoulder joint.
+        shoulder_height = rb_states[:, self.shoulder_body_idx, 2]
+        
+        # Elbow Position (Z-height of flex_1_pole origin) and Orientation
+        elbow_p = rb_states[:, self.elbow_body_idx, 0:3]
+        elbow_q = rb_states[:, self.elbow_body_idx, 3:7]
+        
+        # Tip Offset in Local Frame (Assume length 0.16m along Y based on URDF and COM)
+        # We need to verify the local axis. 
+        # URDF: flex_1_pole COM is at y=0.08. Joint is at 0. So length extends along Y.
+        local_tip = torch.tensor([0.0, 0.16, 0.0], device=self.device).repeat(self.num_envs, 1)
+        
+        # Rotate local offset to global frame
+        tip_offset = quat_apply(elbow_q, local_tip)
+        tip_p = elbow_p + tip_offset
+        tip_height = tip_p[:, 2]
 
         self.rew_buf[:], self.reset_buf[:] = compute_acrobot_reward(
             shoulder_pos, shoulder_vel, elbow_pos, elbow_vel,
+            tip_height, shoulder_height, self.actions,
             self.reset_dist, self.reset_buf, self.progress_buf, self.max_episode_length
         )
 
-    def compute_observations(self, env_ids=None):
-        if env_ids is None:
-            env_ids = np.arange(self.num_envs)
-
+    def compute_observations(self):
         self.gym.refresh_dof_state_tensor(self.sim)
 
-        self.obs_buf[env_ids, 0] = self.dof_pos[env_ids, 0].squeeze() # Shoulder Pos
-        self.obs_buf[env_ids, 1] = self.dof_vel[env_ids, 0].squeeze() # Shoulder Vel
-        self.obs_buf[env_ids, 2] = self.dof_pos[env_ids, 1].squeeze() # Elbow Pos
-        self.obs_buf[env_ids, 3] = self.dof_vel[env_ids, 1].squeeze() # Elbow Vel
+        # ----------------------------------------------------------------------
+        # Improved Observation Space (Sin/Cos Representation)
+        # ----------------------------------------------------------------------
+        # Raw angles are periodic [-pi, pi], which causes discontinuity issues for neural networks.
+        # We transform them into continuous sin/cos components.
+        #
+        # Obs: [sin(theta1), cos(theta1), sin(theta2), cos(theta2), vel1, vel2]
+        # Total: 6 dimensions
+        
+        shoulder_pos = self.dof_pos[:, 0]
+        elbow_pos = self.dof_pos[:, 1]
+        shoulder_vel = self.dof_vel[:, 0]
+        elbow_vel = self.dof_vel[:, 1]
+
+        self.obs_buf[:, 0] = torch.sin(shoulder_pos)
+        self.obs_buf[:, 1] = torch.cos(shoulder_pos)
+        self.obs_buf[:, 2] = torch.sin(elbow_pos)
+        self.obs_buf[:, 3] = torch.cos(elbow_pos)
+        self.obs_buf[:, 4] = shoulder_vel
+        self.obs_buf[:, 5] = elbow_vel
 
         return self.obs_buf
 
     def reset_idx(self, env_ids):
-        # Randomize initial state slightly around upright (0.0)
-        positions = 0.2 * (torch.rand((len(env_ids), self.num_dof), device=self.device) - 0.5)
-        velocities = 0.5 * (torch.rand((len(env_ids), self.num_dof), device=self.device) - 0.5)
+        # Randomize initial state uniformly between -pi and pi
+        positions = 2.0 * np.pi * torch.rand((len(env_ids), self.num_dof), device=self.device) - np.pi
+        velocities = 2.0 * (torch.rand((len(env_ids), self.num_dof), device=self.device) - 0.5)
 
         self.dof_pos[env_ids, :] = positions[:]
         self.dof_vel[env_ids, :] = velocities[:]
@@ -162,6 +255,9 @@ class Acrobot(VecTask):
     def pre_physics_step(self, actions):
         # Apply actions to Shoulder Joint (Index 0)
         # Actions are 1D (num_envs, 1)
+        # Save actions for reward calculation
+        self.actions = actions.clone()
+        
         actions_tensor = torch.zeros(self.num_envs * self.num_dof, device=self.device, dtype=torch.float)
         # We only actuate joint 0. 
         # Layout in tensor: [env0_j0, env0_j1, env1_j0, env1_j1, ...]
@@ -185,43 +281,74 @@ class Acrobot(VecTask):
 #####################################################################
 
 @torch.jit.script
+def normalize_angle(x):
+    # type: (Tensor) -> Tensor
+    return torch.atan2(torch.sin(x), torch.cos(x))
+
+@torch.jit.script
 def compute_acrobot_reward(shoulder_pos, shoulder_vel, elbow_pos, elbow_vel,
-                            reset_dist, reset_buf, progress_buf, max_episode_length):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, Tensor, float) -> Tuple[Tensor, Tensor]
+                           tip_height, shoulder_height, actions,
+                           reset_dist, reset_buf, progress_buf, max_episode_length):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, Tensor, Tensor, float) -> Tuple[Tensor, Tensor]
 
-    # Goal: Keep both poles upright (0.0)
-    # Penalize deviation from 0.0 for both joints
-    # Penalize velocities to encourage stability
+    # ----------------------------------------------------------------------
+    # New Tip Height Reward Strategy (2025-03-13)
+    # ----------------------------------------------------------------------
+    # Based on user feedback: "末端高度" is the most direct signal.
     
-    # Simple L2 penalty reward
-    # reward = 1.0 - shoulder_pos * shoulder_pos - elbow_pos * elbow_pos - 0.01 * torch.abs(shoulder_vel) - 0.01 * torch.abs(elbow_vel)
+    # 1. Tip Height Reward (R_height)
+    #    H_max = 0.32m (0.16 + 0.16)
+    #    R = (H_tip - H_shoulder) / H_max
+    #    Range: [-1, 1] usually (if H_tip < H_shoulder, it's negative)
+    #    User formula: (H_tip - H_shoulder) / H_max
+    h_max = 0.32
+    # Ensure shoulder_height is broadcastable if needed, but it should be (num_envs,)
+    rew_height = (tip_height - shoulder_height) / h_max
     
-    # 优化后的奖励函数
-    # 1. 存活奖励：只要不倒下，给 1.0 分
-    # 2. 姿态奖励：
-    #    - shoulder_pos 越接近 0 越好 (权重 2.0)
-    #    - elbow_pos 越接近 0 越好 (权重 2.0)
-    #    - 使用 exp(-error^2) 形式，使得奖励在目标附近更敏感，远离时衰减平滑
-    # 3. 速度惩罚：
-    #    - 稍微加大一点速度惩罚，防止疯狂摆动 (权重 0.1)
-
-    rew_pos_shoulder = torch.exp(-2.0 * shoulder_pos * shoulder_pos)
-    rew_pos_elbow = torch.exp(-2.0 * elbow_pos * elbow_pos)
-    rew_vel_shoulder = -0.1 * torch.abs(shoulder_vel)
-    rew_vel_elbow = -0.1 * torch.abs(elbow_vel)
-
-    reward = 1.0 + rew_pos_shoulder + rew_pos_elbow + rew_vel_shoulder + rew_vel_elbow
-
-    # Reset conditions
-    # If shoulder moves too far (e.g. > reset_dist)
-    # If elbow moves too far (e.g. > reset_dist)
-    # reset_dist is typically around 3.0 (approx pi)
+    # 2. Velocity Penalty (R_vel)
+    #    - (0.5 * theta1_dot^2 + 1.0 * theta2_dot^2)
+    rew_vel = -1.0 * (0.5 * shoulder_vel.pow(2) + 1.0 * elbow_vel.pow(2))
     
-    reward = torch.where(torch.abs(shoulder_pos) > reset_dist, torch.ones_like(reward) * -2.0, reward)
-    reward = torch.where(torch.abs(elbow_pos) > reset_dist, torch.ones_like(reward) * -2.0, reward)
-
-    reset = torch.where(torch.abs(shoulder_pos) > reset_dist, torch.ones_like(reset_buf), reset_buf)
-    reset = torch.where(torch.abs(elbow_pos) > reset_dist, torch.ones_like(reset_buf), reset)
-    reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset)
-
+    # 3. Action Penalty (R_action)
+    #    - u^2
+    #    Actions are usually [-1, 1] before scaling.
+    rew_action = -1.0 * actions.squeeze().pow(2)
+    
+    # 4. Hover Bonus (R_bonus)
+    #    If R_height > 0.95 AND |vel_sum| < 1.0 -> +10.0
+    #    Otherwise 0.0
+    vel_sum = torch.abs(shoulder_vel) + torch.abs(elbow_vel)
+    is_hover = (rew_height > 0.95) & (vel_sum < 1.0)
+    rew_bonus = torch.where(is_hover, torch.ones_like(rew_height) * 10.0, torch.zeros_like(rew_height))
+    
+    # 5. Anti-Stall Penalty (防止摆烂)
+    #    User feedback: "肩部上抬，肘部重合，抖动摆烂" -> Tip Height approx 0.
+    #    If Tip is near Shoulder (abs(rew_height) < 0.3) AND velocity is low,
+    #    it means the agent is stuck in a local optimum (folded state).
+    #    We punish this heavily to force it to move out of this zone.
+    #    Range: [-0.3, 0.3] -> covering the folded state (0.0).
+    #    Threshold: vel_sum < 3.0 (relaxed to catch jittering too).
+    is_stalled = (torch.abs(rew_height) < 0.3) & (vel_sum < 3.0)
+    rew_stall = torch.where(is_stalled, torch.ones_like(rew_height) * -2.0, torch.zeros_like(rew_height))
+    
+    # Weights
+    w1 = 10.0 # Increase Height weight to overpower penalties
+    w2 = 0.1
+    w3 = 0.05
+    
+    reward = w1 * rew_height + w2 * rew_vel + w3 * rew_action + rew_bonus + rew_stall
+    
+    # ----------------------------------------------------------------------
+    # Reset Logic
+    # ----------------------------------------------------------------------
+    # 1. Reset if spinning too much (Propeller protection)
+    limit = 6.28
+    reset_spin = torch.where(torch.abs(shoulder_pos) > limit, torch.ones_like(reset_buf), reset_buf)
+    
+    # 2. Timeout Reset
+    reset_time = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
+    
+    reset = torch.where(reset_spin > 0, reset_spin, reset_time)
+    
     return reward, reset
+

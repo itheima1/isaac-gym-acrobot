@@ -27,12 +27,15 @@
 
   <!-- Joint: Base -> Shoulder (Fixed Pole) -->
   <!-- Renamed 'base_to_fixed' to 'shoulder_joint' to match config -->
-  <joint name="shoulder_joint" type="continuous">
+  <joint name="shoulder_joint" type="revolute">
     <origin xyz="0 -0.027 0.04" rpy="1.5708 0 0" />
     <parent link="base_link" />
     <child link="fixed_pole" />
     <axis xyz="0 0 1" />
     <dynamics damping="0.005" friction="0.01"/>
+    
+    <!-- Motor with wires: limited to +/- 1 turn -->
+    <limit lower="-6.2831853" upper="6.2831853" effort="1.0" velocity="50.0" />
   </joint>
 
   <!-- Link: Shoulder (Fixed Pole) -->
@@ -66,7 +69,12 @@
     <parent link="fixed_pole" />
     <child link="flex_1_pole" />
     <axis xyz="0 0 1" />
-    <dynamics damping="0.005" friction="0.01"/>
+    <!-- Ultra Low Friction Bearing: nearly ideal -->
+    <!-- damping=0.0001, friction=0.0 -->
+    <dynamics damping="0.0001" friction="0.0"/>
+    
+    <!-- No limit for bearing joint -->
+    <!-- <limit lower="-6.2831853" upper="6.2831853" effort="5.0" velocity="50.0" /> -->
   </joint>
 
   <!-- Link: Elbow (Flex 1 Pole) -->
